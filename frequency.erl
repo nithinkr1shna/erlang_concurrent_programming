@@ -7,17 +7,17 @@
 %%   (c) Francesco Cesarini and Simon Thompson
 
 -module(frequency).
--export([init/0,start/0,allocate/0,deallocate/1,stop/0]).
+-export([start/0,allocate/0,deallocate/1,stop/0,client_loop/1]).
+-export([init/0,client_start/0,client_init/0]).
 
 %% These are the start functions used to create and
 %% initialize the server.
 
-
-start()->  %%start the frequency server by calling frequency:start() from the shell.
-    register(?MODULE,spawn(?MODULE,init,[])).
-
+start() ->
+    register(frequency, spawn(frequency, init, [])).
 
 init() ->
+  process_flag(trap_exit, true),    %%% ADDED
   Frequencies = {get_frequencies(), []},
   loop(Frequencies).
 
@@ -31,17 +31,38 @@ loop(Frequencies) ->
     {request, Pid, allocate} ->
       {NewFrequencies, Reply} = allocate(Frequencies, Pid),
       Pid ! {reply, Reply},
-      io:format("NewFrequencies ~w~n",[NewFrequencies]),
-      io:format("Reply ~w~n",[Reply]),
       loop(NewFrequencies);
     {request, Pid , {deallocate, Freq}} ->
       NewFrequencies = deallocate(Frequencies, Freq),
       Pid ! {reply, ok},
-      io:format("~w~n",[NewFrequencies]),
       loop(NewFrequencies);
     {request, Pid, stop} ->
-      Pid ! {reply, stopped}
+      Pid ! {reply, stopped};
+    {'EXIT', Pid, _Reason} ->                   %%% CLAUSE ADDED
+      NewFrequencies = exited(Frequencies, Pid), 
+      loop(NewFrequencies)
   end.
+
+%% Functional interface
+
+allocate() -> 
+    frequency ! {request, self(), allocate},
+    receive 
+	    {reply, Reply} -> Reply
+    end.
+
+deallocate(Freq) -> 
+    frequency ! {request, self(), {deallocate, Freq}},
+    receive 
+	    {reply, Reply} -> Reply
+    end.
+
+stop() -> 
+    frequency ! {request, self(), stop},
+    receive 
+	    {reply, Reply} -> Reply
+    end.
+
 
 %% The Internal Help Functions used to allocate and
 %% deallocate frequencies.
@@ -49,24 +70,47 @@ loop(Frequencies) ->
 allocate({[], Allocated}, _Pid) ->
   {{[], Allocated}, {error, no_frequency}};
 allocate({[Freq|Free], Allocated}, Pid) ->
-  case lists:keymember(Pid,2,Allocated) of
-    true -> {{[Freq|Free],Allocated},{already_allocated,Pid}}; %% check for already allocated frequency for a process id Pid.
-    false-> {{Free, [{Freq, Pid}|Allocated]}, {ok, Freq}} %% if not already allocated , allocates a new frequency.
-       
-  end.
+  link(Pid),                                               %%% ADDED
+  {{Free, [{Freq, Pid}|Allocated]}, {ok, Freq}}.
 
 deallocate({Free, Allocated}, Freq) ->
-  case length(Allocated) of %% checks for length of list Allocated
-     1 -> NewAllocated=lists:keydelete(Freq, 1, Allocated), %% if length is 1 (is allocated) then add delete the frequency and add to list of 
-          {[Freq|Free],  NewAllocated};                     %% free frequencies.
-     0 -> io:format("Already deallocated~n"), %% if length is 0 (not allocated) then no more deallocation, no new freq is added to list Free.
-          {Free, Allocated}
-  end.
-  
-allocate()->
-    ?MODULE ! {request,self(),allocate}.
+  {value,{Freq,Pid}} = lists:keysearch(Freq,1,Allocated),  %%% ADDED
+  unlink(Pid),                                             %%% ADDED
+  NewAllocated=lists:keydelete(Freq, 1, Allocated),
+  {[Freq|Free],  NewAllocated}.
 
-deallocate(Freq)->
-   ?MODULE ! {request,self(),{deallocate,Freq}}.
-stop()->
-    ?MODULE ! {request,self(),stop}.
+exited({Free, Allocated}, Pid) ->                %%% FUNCTION ADDED
+    case lists:keysearch(Pid,2,Allocated) of
+      {value,{Freq,Pid}} ->
+        NewAllocated = lists:keydelete(Freq,1,Allocated),
+        {[Freq|Free],NewAllocated}; 
+      false ->
+        {Free,Allocated} 
+    end.
+
+
+%%client modelled.
+
+client_start()->
+    register(client,spawn(?MODULE,client_init,[])).
+
+client_init()->
+    process_flag(trap_exit, true),
+    client_loop([]).
+
+client_loop(Allocated)->
+    receive
+      allocate->
+	    {ok,Freq} = allocate(),
+	    io:format("~w allocated~n",[Freq]),
+            client_loop([Freq|Allocated]);
+      deallocate->
+            [Freq|Frequencies] = Allocated,
+	    deallocate(Freq),
+	    client_loop(Frequencies);
+
+      {'EXIT',Pid,Reason} ->
+		  io:format("~w ended for reason ~s",Pid,Reason),
+	          client_loop(Allocated)	 
+     
+    end.
